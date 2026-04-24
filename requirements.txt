@@ -1,0 +1,8 @@
+streamlit
+numpy
+langchain-community
+langchain-text-splitters
+langchain-groq
+pypdf
+python-docx
+faiss-cpu
