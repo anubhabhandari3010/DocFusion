@@ -3,6 +3,7 @@ import os
 import tempfile
 import hashlib
 import numpy as np
+from langchain_core.messages import HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -59,6 +60,26 @@ class SimpleHashEmbeddings(Embeddings):
 
 
 
+def translate_text(text: str, target_language: str, model_name: str, api_key: str) -> str:
+    """Translate text using Groq LLM."""
+    if not text or not text.strip():
+        return ""
+    llm = ChatGroq(
+        model_name=model_name,
+        groq_api_key=api_key,
+        temperature=0.3,
+        max_tokens=4096
+    )
+    prompt = f"""Translate the following text to {target_language}.
+Preserve the original formatting, paragraph structure, and meaning as closely as possible.
+Do not add any explanations, notes, or commentary — output only the translated text.
+
+Text to translate:
+{text}"""
+    response = llm.invoke([HumanMessage(content=prompt)])
+    return response.content
+
+
 # Page configuration
 st.set_page_config(page_title="DocFusion - RAG Chat", page_icon="📄", layout="wide")
 
@@ -85,6 +106,8 @@ if 'qa_chain' not in st.session_state:
     st.session_state.qa_chain = None
 if 'messages' not in st.session_state:
     st.session_state.messages = []
+if 'translated_text' not in st.session_state:
+    st.session_state.translated_text = ""
 
 # Title and description
 st.title("📄 DocFusion - Document Q&A")
@@ -164,6 +187,9 @@ with col2:
                                       help="Upload a PDF document to query")
     
     if uploaded_file is not None:
+        # Clear previous translation when a new file is uploaded
+        st.session_state.translated_text = ""
+
         with st.spinner("Processing document..."):
             # Save uploaded file temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -218,6 +244,61 @@ with col2:
                     else:
                         st.warning("⚠️ Please set your GROQ_API_KEY in .streamlit/secrets.toml (local) or Streamlit Cloud Secrets to enable Q&A")
 
+                    # ---------- Translation Section ----------
+                    st.markdown("---")
+                    st.subheader("🌐 Translation")
+
+                    if GROQ_API_KEY:
+                        target_lang = st.selectbox(
+                            "Target Language",
+                            ["Spanish", "French", "German", "Hindi", "Chinese (Simplified)",
+                             "Japanese", "Portuguese", "Arabic", "Russian", "Italian", "Korean", "Dutch"],
+                            key="target_lang"
+                        )
+
+                        if st.button("Translate Document", key="translate_btn"):
+                            with st.spinner("Translating... This may take a moment for large documents."):
+                                full_text = "\n\n".join([d.page_content for d in docs])
+
+                                # Split into translation chunks (~3000 chars)
+                                trans_chunks = []
+                                current_chunk = ""
+                                for paragraph in full_text.split("\n\n"):
+                                    if len(current_chunk) + len(paragraph) < 3000:
+                                        current_chunk += "\n\n" + paragraph if current_chunk else paragraph
+                                    else:
+                                        if current_chunk:
+                                            trans_chunks.append(current_chunk)
+                                        current_chunk = paragraph
+                                if current_chunk:
+                                    trans_chunks.append(current_chunk)
+
+                                translated_parts = []
+                                progress_bar = st.progress(0)
+
+                                for i, chunk in enumerate(trans_chunks):
+                                    translated = translate_text(chunk, target_lang, model_name, GROQ_API_KEY)
+                                    translated_parts.append(translated)
+                                    progress_bar.progress((i + 1) / len(trans_chunks))
+
+                                st.session_state.translated_text = "\n\n".join(translated_parts)
+                                progress_bar.empty()
+
+                                st.success(f"✅ Translation to {target_lang} complete!")
+
+                        if st.session_state.get("translated_text"):
+                            with st.expander("📄 View Translated Text", expanded=False):
+                                st.text_area("Translation", st.session_state.translated_text, height=300)
+
+                            file_stem = os.path.splitext(uploaded_file.name)[0]
+                            st.download_button(
+                                label="💾 Download Translation (.txt)",
+                                data=st.session_state.translated_text.encode("utf-8"),
+                                file_name=f"{file_stem}_{target_lang.lower().replace(' ', '_')}.txt",
+                                mime="text/plain"
+                            )
+                    else:
+                        st.info("Set your GROQ_API_KEY in secrets to enable translation.")
 
             except Exception as e:
                 import traceback

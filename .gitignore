@@ -15,6 +15,11 @@ myenv/
 venv/
 ENV/
 
+# Old / unused app files
+app_doc_fusion.py
+doc_fusion.pkl
+todel/
+
 # IDEs
 .vscode/
 .idea/
