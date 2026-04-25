@@ -3,7 +3,10 @@ import os
 import tempfile
 import hashlib
 import numpy as np
+import docx
+import openpyxl
 from langchain_core.messages import HumanMessage
+from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -80,6 +83,48 @@ Text to translate:
     return response.content
 
 
+
+def extract_documents(file_path: str, file_name: str):
+    """Extract text documents from PDF, TXT, DOCX, or XLSX files."""
+    ext = os.path.splitext(file_name)[1].lower()
+
+    if ext == ".pdf":
+        loader = PyPDFLoader(file_path)
+        return loader.load()
+
+    elif ext == ".txt":
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, "r", encoding="latin-1") as f:
+                text = f.read()
+        return [Document(page_content=text, metadata={"source": file_name})]
+
+    elif ext == ".docx":
+        document = docx.Document(file_path)
+        paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
+        text = "\n\n".join(paragraphs)
+        return [Document(page_content=text, metadata={"source": file_name})]
+
+    elif ext == ".xlsx":
+        workbook = openpyxl.load_workbook(file_path, data_only=True)
+        parts = []
+        for sheet_name in workbook.sheetnames:
+            sheet = workbook[sheet_name]
+            sheet_lines = [f"Sheet: {sheet_name}"]
+            for row in sheet.iter_rows(values_only=True):
+                row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
+                if row_text.strip():
+                    sheet_lines.append(row_text)
+            parts.append("\n".join(sheet_lines))
+        text = "\n\n".join(parts)
+        return [Document(page_content=text, metadata={"source": file_name})]
+
+    else:
+        raise ValueError(f"Unsupported file type: {ext}. Please upload a PDF, TXT, DOCX, or XLSX file.")
+
+
 # Page configuration
 st.set_page_config(page_title="DocFusion - RAG Chat", page_icon="📄", layout="wide")
 
@@ -104,14 +149,20 @@ if 'vector_db' not in st.session_state:
     st.session_state.vector_db = None
 if 'qa_chain' not in st.session_state:
     st.session_state.qa_chain = None
+if 'docs' not in st.session_state:
+    st.session_state.docs = None
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'translated_text' not in st.session_state:
     st.session_state.translated_text = ""
+if 'current_file_key' not in st.session_state:
+    st.session_state.current_file_key = None
+if 'processing_key' not in st.session_state:
+    st.session_state.processing_key = None
 
 # Title and description
 st.title("📄 DocFusion - Document Q&A")
-st.markdown("Upload a PDF document and ask questions about its content using AI-powered RAG (Retrieval-Augmented Generation)")
+st.markdown("Upload a document and ask questions about its content using AI-powered RAG (Retrieval-Augmented Generation)")
 
 # Sidebar for configuration
 with st.sidebar:
@@ -130,17 +181,18 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("**How to use:**")
-    st.markdown("1. Upload a PDF document in the right panel")
+    st.markdown("1. Upload a document (PDF, TXT, Word, or Excel) in the right panel")
     st.markdown("2. Wait for processing (embeddings are created locally)")
     st.markdown("3. Ask questions about the document in the left chat panel")
-    st.markdown("4. The AI will answer based on your document content")
-    
+    st.markdown("4. Translate and download the document in your chosen language")
+
     st.markdown("---")
     st.markdown("**Features:**")
     st.markdown("• 100% free - no paid API keys needed")
     st.markdown("• Local embeddings (no OpenAI/HuggingFace costs)")
     st.markdown("• Fast Groq LLM inference")
-    st.markdown("• Supports any PDF document")
+    st.markdown("• Supports PDF, TXT, Word, and Excel documents")
+    st.markdown("• Multi-lingual AI translation with download")
 
 
 # Main content area
@@ -173,7 +225,7 @@ with col1:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         try:
-                            response = st.session_state.qa_chain.run(query)
+                            response = st.session_state.qa_chain.invoke({"query": query})["result"]
                             st.markdown(response)
                             st.session_state.messages.append({"role": "assistant", "content": response})
                         except Exception as e:
@@ -183,132 +235,172 @@ with col1:
 
 with col2:
     st.markdown('<p class="upload-text">📤 Upload Your Document</p>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", 
-                                      help="Upload a PDF document to query")
-    
+    uploaded_file = st.file_uploader("Choose a document", type=["pdf", "txt", "docx", "xlsx"],
+                                      help="Upload a PDF, TXT, Word, or Excel document")
+
     if uploaded_file is not None:
-        # Clear previous translation when a new file is uploaded
-        st.session_state.translated_text = ""
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
 
-        with st.spinner("Processing document..."):
-            # Save uploaded file temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_file_path = tmp_file.name
-            
-            try:
-                # Load and process the document
-                loader = PyPDFLoader(tmp_file_path)
-                docs = loader.load()
+        # Detect if a new file was uploaded
+        current_file_key = (uploaded_file.name, file_hash)
+        prev_file_key = st.session_state.get("current_file_key")
 
-                if not docs:
-                    st.error("❌ Could not extract any text from this PDF. It may be a scanned/image-based PDF with no embedded text.")
-                    st.stop()
+        if prev_file_key != current_file_key:
+            st.session_state.current_file_key = current_file_key
+            st.session_state.translated_text = ""
+            st.session_state.messages = []
 
-                # Split into chunks
-                splitter = CharacterTextSplitter(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap
+        # Determine if reprocessing is needed
+        processing_key = (file_hash, chunk_size, chunk_overlap, model_name)
+        needs_processing = (
+            st.session_state.get("processing_key") != processing_key
+            or st.session_state.get("vector_db") is None
+        )
+
+        if needs_processing:
+            # Clear stale state before attempting new processing
+            st.session_state.vector_db = None
+            st.session_state.docs = None
+            st.session_state.qa_chain = None
+            st.session_state.processing_key = None
+
+            with st.spinner("Processing document..."):
+                # Save uploaded file temporarily
+                file_ext = os.path.splitext(uploaded_file.name)[1]
+                tmp_file_path = None
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
+                    tmp_file.write(file_bytes)
+                    tmp_file_path = tmp_file.name
+
+                try:
+                    # Load and process the document
+                    docs = extract_documents(tmp_file_path, uploaded_file.name)
+
+                    if not docs:
+                        st.error("❌ Could not extract any text from this document. It may be a scanned/image-based file with no embedded text.")
+                        st.stop()
+
+                    # Split into chunks
+                    splitter = CharacterTextSplitter(
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap
+                    )
+                    chunks = splitter.split_documents(docs)
+
+                    # Filter out empty chunks to avoid FAISS indexing errors
+                    chunks = [c for c in chunks if c.page_content and c.page_content.strip()]
+
+                    if not chunks:
+                        st.error("❌ Document loaded but all content appears to be empty. The file may be scanned or image-based.")
+                        st.stop()
+
+                    # Create embeddings and vector store
+                    with st.spinner("Creating embeddings and building vector store..."):
+                        # Using simple hash-based embeddings (no API key, no PyTorch)
+                        embeddings = SimpleHashEmbeddings(dim=384)
+                        vector_db = FAISS.from_documents(chunks, embeddings)
+
+                        st.session_state.vector_db = vector_db
+                        st.session_state.docs = docs
+                        st.session_state.processing_key = processing_key
+
+                        # Create QA chain using the API key from configuration
+                        if GROQ_API_KEY:
+                            retriever = vector_db.as_retriever()
+                            qa_chain = RetrievalQA.from_chain_type(
+                                llm=ChatGroq(
+                                    model_name=model_name,
+                                    groq_api_key=GROQ_API_KEY
+                                ),
+                                chain_type="stuff",
+                                retriever=retriever
+                            )
+                            st.session_state.qa_chain = qa_chain
+
+                            st.success(f"✅ Document processed successfully! ({len(docs)} pages, {len(chunks)} chunks)")
+                        else:
+                            st.warning("⚠️ Please set your GROQ_API_KEY in .streamlit/secrets.toml (local) or Streamlit Cloud Secrets to enable Q&A")
+
+                except Exception as e:
+                    import traceback
+                    st.error(f"❌ Error processing document: {type(e).__name__}: {str(e)}")
+                    st.code(traceback.format_exc())
+                finally:
+                    # Clean up temporary file
+                    if tmp_file_path and os.path.exists(tmp_file_path):
+                        os.remove(tmp_file_path)
+
+        # Lazily create QA chain if key is now available but chain is missing
+        if GROQ_API_KEY and st.session_state.get("vector_db") and not st.session_state.get("qa_chain"):
+            retriever = st.session_state.vector_db.as_retriever()
+            st.session_state.qa_chain = RetrievalQA.from_chain_type(
+                llm=ChatGroq(
+                    model_name=model_name,
+                    groq_api_key=GROQ_API_KEY
+                ),
+                chain_type="stuff",
+                retriever=retriever
+            )
+
+        # ---------- Translation Section ----------
+        if st.session_state.get("vector_db"):
+            st.markdown("---")
+            st.subheader("🌐 Translation")
+
+            if GROQ_API_KEY:
+                target_lang = st.selectbox(
+                    "Target Language",
+                    ["English", "Spanish", "French", "German", "Hindi", "Chinese (Simplified)",
+                     "Japanese", "Portuguese", "Arabic", "Russian", "Italian", "Korean", "Dutch"],
+                    key="target_lang"
                 )
-                chunks = splitter.split_documents(docs)
 
-                # Filter out empty chunks to avoid FAISS indexing errors
-                chunks = [c for c in chunks if c.page_content and c.page_content.strip()]
+                if st.button("Translate Document", key="translate_btn"):
+                    with st.spinner("Translating... This may take a moment for large documents."):
+                        docs = st.session_state.docs
+                        full_text = "\n\n".join([d.page_content for d in docs])
 
-                if not chunks:
-                    st.error("❌ Document loaded but all pages appear to be empty. The PDF may be scanned or image-based.")
-                    st.stop()
-
-                # Create embeddings and vector store
-                with st.spinner("Creating embeddings and building vector store..."):
-                    # Using simple hash-based embeddings (no API key, no PyTorch)
-                    embeddings = SimpleHashEmbeddings(dim=384)
-                    vector_db = FAISS.from_documents(chunks, embeddings)
-
-                    st.session_state.vector_db = vector_db
-
-                    # Create QA chain using the API key from configuration
-                    if GROQ_API_KEY:
-                        retriever = vector_db.as_retriever()
-                        qa_chain = RetrievalQA.from_chain_type(
-                            llm=ChatGroq(
-                                model_name=model_name,
-                                groq_api_key=GROQ_API_KEY
-                            ),
-                            chain_type="stuff",
-                            retriever=retriever
-                        )
-                        st.session_state.qa_chain = qa_chain
-
-                        st.success(f"✅ Document processed successfully! ({len(docs)} pages, {len(chunks)} chunks)")
-                    else:
-                        st.warning("⚠️ Please set your GROQ_API_KEY in .streamlit/secrets.toml (local) or Streamlit Cloud Secrets to enable Q&A")
-
-                    # ---------- Translation Section ----------
-                    st.markdown("---")
-                    st.subheader("🌐 Translation")
-
-                    if GROQ_API_KEY:
-                        target_lang = st.selectbox(
-                            "Target Language",
-                            ["Spanish", "French", "German", "Hindi", "Chinese (Simplified)",
-                             "Japanese", "Portuguese", "Arabic", "Russian", "Italian", "Korean", "Dutch"],
-                            key="target_lang"
-                        )
-
-                        if st.button("Translate Document", key="translate_btn"):
-                            with st.spinner("Translating... This may take a moment for large documents."):
-                                full_text = "\n\n".join([d.page_content for d in docs])
-
-                                # Split into translation chunks (~3000 chars)
-                                trans_chunks = []
-                                current_chunk = ""
-                                for paragraph in full_text.split("\n\n"):
-                                    if len(current_chunk) + len(paragraph) < 3000:
-                                        current_chunk += "\n\n" + paragraph if current_chunk else paragraph
-                                    else:
-                                        if current_chunk:
-                                            trans_chunks.append(current_chunk)
-                                        current_chunk = paragraph
+                        # Split into translation chunks (~3000 chars)
+                        trans_chunks = []
+                        current_chunk = ""
+                        for paragraph in full_text.split("\n\n"):
+                            if len(current_chunk) + len(paragraph) < 3000:
+                                current_chunk += "\n\n" + paragraph if current_chunk else paragraph
+                            else:
                                 if current_chunk:
                                     trans_chunks.append(current_chunk)
+                                current_chunk = paragraph
+                        if current_chunk:
+                            trans_chunks.append(current_chunk)
 
-                                translated_parts = []
-                                progress_bar = st.progress(0)
+                        translated_parts = []
+                        progress_bar = st.progress(0)
 
-                                for i, chunk in enumerate(trans_chunks):
-                                    translated = translate_text(chunk, target_lang, model_name, GROQ_API_KEY)
-                                    translated_parts.append(translated)
-                                    progress_bar.progress((i + 1) / len(trans_chunks))
+                        for i, chunk in enumerate(trans_chunks):
+                            translated = translate_text(chunk, target_lang, model_name, GROQ_API_KEY)
+                            translated_parts.append(translated)
+                            progress_bar.progress((i + 1) / len(trans_chunks))
 
-                                st.session_state.translated_text = "\n\n".join(translated_parts)
-                                progress_bar.empty()
+                        st.session_state.translated_text = "\n\n".join(translated_parts)
+                        progress_bar.empty()
 
-                                st.success(f"✅ Translation to {target_lang} complete!")
+                        st.success(f"✅ Translation to {target_lang} complete!")
 
-                        if st.session_state.get("translated_text"):
-                            with st.expander("📄 View Translated Text", expanded=False):
-                                st.text_area("Translation", st.session_state.translated_text, height=300)
+                if st.session_state.get("translated_text"):
+                    with st.expander("📄 View Translated Text", expanded=False):
+                        st.text_area("Translation", st.session_state.translated_text, height=300)
 
-                            file_stem = os.path.splitext(uploaded_file.name)[0]
-                            st.download_button(
-                                label="💾 Download Translation (.txt)",
-                                data=st.session_state.translated_text.encode("utf-8"),
-                                file_name=f"{file_stem}_{target_lang.lower().replace(' ', '_')}.txt",
-                                mime="text/plain"
-                            )
-                    else:
-                        st.info("Set your GROQ_API_KEY in secrets to enable translation.")
-
-            except Exception as e:
-                import traceback
-                st.error(f"❌ Error processing document: {type(e).__name__}: {str(e)}")
-                st.code(traceback.format_exc())
-            finally:
-                # Clean up temporary file
-                if os.path.exists(tmp_file_path):
-                    os.remove(tmp_file_path)
+                    file_stem = os.path.splitext(uploaded_file.name)[0]
+                    st.download_button(
+                        label="💾 Download Translation (.txt)",
+                        data=st.session_state.translated_text.encode("utf-8"),
+                        file_name=f"{file_stem}_{target_lang.lower().replace(' ', '_')}.txt",
+                        mime="text/plain"
+                    )
+            else:
+                st.info("Set your GROQ_API_KEY in secrets to enable translation.")
 
 # Footer
 st.markdown("---")
-st.markdown("Built with Streamlit, LangChain, and Groq | Powered by RAG technology")
+st.markdown("Built with Streamlit, LangChain, and Groq | Multi-format RAG & Translation")
