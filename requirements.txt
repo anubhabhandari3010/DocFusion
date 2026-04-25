@@ -5,4 +5,5 @@ langchain-text-splitters
 langchain-groq
 pypdf
 python-docx
+openpyxl
 faiss-cpu
